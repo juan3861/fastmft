@@ -1,0 +1,24 @@
+# Binaries and executables
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.bin
+
+# Backups and temporary files
+*.bak
+*.bak_*
+*.tmp
+*.log
+
+# Test artifacts and outputs
+out/
+dist/
+build/
+
+# IDE and OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
