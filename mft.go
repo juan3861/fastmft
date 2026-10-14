@@ -130,6 +130,13 @@ type mftEngine struct {
 	attrRaw []byte
 	attrErr string
 
+	// mftBitmapRaw/bitmap - mapa de bits de alocação de registros do $MFT (atributo 0xB0).
+	mftBitmapRaw []byte
+	bitmap       *MftBitmap
+	skippedRecs  int
+	fastMode     bool
+
+
 	started time.Time
 	topN    int
 	errN    int64
@@ -465,6 +472,26 @@ func (e *mftEngine) mftDataRuns() ([]mftRun, int64, int, error) {
 					}
 				}
 			}
+			if t == 0xB0 && len(e.mftBitmapRaw) == 0 {
+				if buf[off+8] == 0 {
+					// $BITMAP residente
+					vlen := int(binary.LittleEndian.Uint32(buf[off+16:]))
+					voff := int(binary.LittleEndian.Uint16(buf[off+20:]))
+					if vlen > 0 && voff+vlen <= l {
+						e.mftBitmapRaw = append([]byte(nil), buf[off+voff:off+voff+vlen]...)
+					}
+				} else {
+					// $BITMAP não-residente
+					runOff := int(binary.LittleEndian.Uint16(buf[off+32:]))
+					real := int64(binary.LittleEndian.Uint64(buf[off+48:]))
+					if off+runOff <= len(buf) && real > 0 {
+						rl := parseRunList(buf[off+runOff : off+l])
+						if b, err := e.readRuns(rl, real); err == nil {
+							e.mftBitmapRaw = b
+						}
+					}
+				}
+			}
 			off += l
 		}
 	}
@@ -474,7 +501,7 @@ func (e *mftEngine) mftDataRuns() ([]mftRun, int64, int, error) {
 		return nil, 0, 0, fmt.Errorf("MFT sem runlist $DATA (dataSize=%d)", dataSize)
 	}
 
-	// Segue $ATTRIBUTE_LIST -> extents $DATA em registros de extensão.
+	// Segue $ATTRIBUTE_LIST -> extents $DATA e $BITMAP em registros de extensão.
 	// Entrada: type(4) len(2) nameLen(1) nameOff(1) lowestVcn(8) ref(8) attrId(2)
 	if len(attrList) > 0 {
 		for off := 0; off+26 <= len(attrList); {
@@ -485,7 +512,7 @@ func (e *mftEngine) mftDataRuns() ([]mftRun, int64, int, error) {
 			}
 			lowVcn := int64(binary.LittleEndian.Uint64(attrList[off+8:]))
 			ref := binary.LittleEndian.Uint64(attrList[off+16:]) & 0xFFFFFFFFFFFF
-			if t == 0x80 && lowVcn > 0 && ref > 0 {
+			if ((t == 0x80 && lowVcn > 0) || t == 0xB0) && ref > 0 {
 				if bo, ok := e.recOffset(segs, ref); ok {
 					if b2, err := e.readAligned(bo, e.recordSize); err == nil &&
 						string(b2[:4]) == "FILE" && e.fixup(b2) {
@@ -1188,6 +1215,9 @@ func (e *mftEngine) build() error {
 		// recordCount = tamanho REAL do $MFT (a runlist inicial pode cobrir
 		// menos; extents de continuação são descobertos durante a leitura).
 		e.recordCount = int(dataSize / int64(e.recordSize))
+		if len(e.mftBitmapRaw) > 0 {
+			e.bitmap = newMftBitmap(e.mftBitmapRaw, e.recordCount)
+		}
 	}
 	if e.recordCount < 16 {
 		return fmt.Errorf("MFT pequena demais (%d registros)", e.recordCount)
@@ -1262,8 +1292,10 @@ func (e *mftEngine) build() error {
 
 	// ---- aplicar nomes/$DATA de registros de extensão ----
 	e.recsRead = parsed
-	e.applyExtensions()
-	mark("extensions")
+	if !e.fastMode {
+		e.applyExtensions()
+		mark("extensions")
+	}
 
 	if e.snapDir != "" {
 		if err := e.SaveSnapshot(e.snapDir, nil, e.snapUsnID, e.snapNextUsn); err != nil {

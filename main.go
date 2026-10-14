@@ -30,7 +30,7 @@ import (
 
 // engineVersion - versao do motor. BUMPAR a cada frente fechada: a medicao so
 // vale se o binario medido for rastreavel ao fonte (SHA-256 reproduzivel).
-const engineVersion = "0.4.1"
+const engineVersion = "1.1.0"
 
 func main() {
 	args := os.Args[1:]
@@ -121,6 +121,7 @@ type scanOpts struct {
 	MemMB    int  // orcamento de RAM p/ volumes em paralelo (0 = 60% da livre)
 	BufMB    int  // orcamento do pool de buffers por volume em MB (0 = 32)
 	Snapshot string // pasta onde gravar o snapshot do estado (F4)
+	Fast     bool   // modo ultra-rapido (pula registros de extensao na arvore)
 }
 
 // applyIO - aplica os ajustes de I/O que dependem de open() (recordSize).
@@ -129,6 +130,9 @@ type scanOpts struct {
 func (e *mftEngine) applyIO(o *scanOpts) {
 	if o == nil {
 		return
+	}
+	if o.Fast {
+		e.fastMode = true
 	}
 	if o.BufMB > 0 {
 		e.bufMB = o.BufMB
@@ -180,6 +184,9 @@ func parseScan(args []string) *scanOpts {
 			i++
 		case a == "--files":
 			o.Files = true
+			i++
+		case a == "--fast":
+			o.Fast = true
 			i++
 		case a == "--elevate":
 			o.Elevate = true
@@ -295,6 +302,15 @@ func runScan(o *scanOpts) {
 				if o.Idle {
 					childArgs = append(childArgs, "--idle")
 				}
+				if o.Fast {
+					childArgs = append(childArgs, "--fast")
+				}
+				if o.NoBuf {
+					childArgs = append(childArgs, "--nobuf")
+				}
+				if o.IoRead > 0 {
+					childArgs = append(childArgs, "--ioread", strconv.Itoa(o.IoRead))
+				}
 				if o.Find != "" {
 					childArgs = append(childArgs, "--find", o.Find)
 				}
@@ -327,6 +343,9 @@ func runScanAll(o *scanOpts) {
 		childArgs := []string{"scan", "ALL", "--mode", "mft", "--top", strconv.Itoa(o.TopN), "--out", out, "--child"}
 		if o.Idle {
 			childArgs = append(childArgs, "--idle")
+		}
+		if o.Fast {
+			childArgs = append(childArgs, "--fast")
 		}
 		if o.Serial {
 			childArgs = append(childArgs, "--serial")
@@ -569,10 +588,14 @@ func runMftFile(args []string) {
 	memBudget := 0
 	snapOut := ""
 	loadSnap := ""
+	fast := false
 	i := 0
 	for i < len(args) {
 		a := args[i]
 		switch {
+		case a == "--fast":
+			fast = true
+			i++
 		case a == "--top" && i+1 < len(args):
 			top = atoiSafe(args[i+1], 50)
 			i += 2
@@ -666,7 +689,7 @@ func runMftFile(args []string) {
 			if err := e.openFile(path); err != nil {
 				fatal(err.Error())
 			}
-			e.applyIO(&scanOpts{IoRead: ioRead, NoBuf: noBuf})
+			e.applyIO(&scanOpts{IoRead: ioRead, NoBuf: noBuf, Fast: fast})
 			e.rootName = filepath.Base(path)
 			// O snapshot e gravado dentro de build(), ANTES da agregacao
 			// (o estado pos-agregacao nao e folha e re-agregar infla).
@@ -703,7 +726,7 @@ func runMftFile(args []string) {
 			if err := e.openFile(p); err != nil {
 				return volRow{}, err
 			}
-			e.applyIO(&scanOpts{IoRead: ioRead, NoBuf: noBuf})
+			e.applyIO(&scanOpts{IoRead: ioRead, NoBuf: noBuf, Fast: fast})
 			e.rootName = filepath.Base(p)
 			if err := e.build(); err != nil {
 				return volRow{}, err

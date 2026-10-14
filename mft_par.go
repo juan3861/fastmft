@@ -24,6 +24,7 @@ package main
 import (
 	"encoding/binary"
 	"fmt"
+	"os"
 	"runtime"
 	"sync"
 )
@@ -139,6 +140,9 @@ func (e *mftEngine) parseOne(sh *shard, idx int, rec []byte) {
 	if baseRef := binary.LittleEndian.Uint64(rec[0x20:]) & 0xFFFFFFFFFFFF; baseRef != 0 {
 		// ---- registro de EXTENSAO ----
 		sh.extRecs++
+		if e.fastMode {
+			return
+		}
 		if !e.fixup(rec) {
 			return
 		}
@@ -304,6 +308,7 @@ func (e *mftEngine) streamMFTPar(runs []mftRun, done map[int]int) int {
 		tr = taskRecs
 	}
 	var tasks []task
+	skippedRecs := 0
 	for _, sg := range segs {
 		d := done[sg.startIdx]
 		if d >= sg.count {
@@ -314,13 +319,25 @@ func (e *mftEngine) streamMFTPar(runs []mftRun, done map[int]int) int {
 			if n > tr {
 				n = tr
 			}
+			rec0 := sg.startIdx + k
+			if e.bitmap != nil && !e.bitmap.chunkHasInUse(rec0, n) {
+				skippedRecs += n
+				continue
+			}
 			tasks = append(tasks, task{
-				idx0:  sg.startIdx + k,
+				idx0:  rec0,
 				nrecs: n,
 				phys:  sg.phys + int64(k)*int64(e.recordSize),
 			})
 		}
 		done[sg.startIdx] = sg.count
+	}
+	e.skippedRecs += skippedRecs
+	e.deleted += int64(skippedRecs)
+
+	if skippedRecs > 0 && os.Getenv("AETHERSCAN_TIMING") != "" {
+		fmt.Fprintf(os.Stderr, "[mft-bitmap] pulados %d registros (~%.1f MB de I/O economizados)\n",
+			skippedRecs, float64(skippedRecs*e.recordSize)/(1<<20))
 	}
 	if len(tasks) == 0 {
 		return 0

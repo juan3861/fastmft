@@ -146,6 +146,44 @@ func deviceIoControl(h syscall.Handle, code uint32, in unsafe.Pointer, inLen uin
 	return br, nil
 }
 
+const (
+	ioctlStorageQueryProperty        = 0x002D1400
+	storageDeviceSeekPenaltyProperty = 7
+	propertyStandardQuery            = 0
+)
+
+type storagePropertyQuery struct {
+	PropertyID           uint32
+	QueryType            uint32
+	AdditionalParameters [1]byte
+}
+
+type deviceSeekPenaltyDescriptor struct {
+	Version           uint32
+	Size              uint32
+	IncursSeekPenalty bool
+}
+
+// isRotationalHDD consulta se o dispositivo de bloco possui penalidade de busca (HDD mecânico).
+func isRotationalHDD(h syscall.Handle) bool {
+	if h == syscall.InvalidHandle {
+		return false
+	}
+	var q storagePropertyQuery
+	q.PropertyID = storageDeviceSeekPenaltyProperty
+	q.QueryType = propertyStandardQuery
+
+	var desc deviceSeekPenaltyDescriptor
+	_, err := deviceIoControl(h, ioctlStorageQueryProperty,
+		unsafe.Pointer(&q), uint32(unsafe.Sizeof(q)),
+		unsafe.Pointer(&desc), uint32(unsafe.Sizeof(desc)))
+	if err != nil {
+		return false
+	}
+	return desc.IncursSeekPenalty
+}
+
+
 // memStatusEx - espelho de MEMORYSTATUSEX (winnt.h).
 type memStatusEx struct {
 	length               uint32
