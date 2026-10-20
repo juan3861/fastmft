@@ -185,7 +185,7 @@ func (e *mftEngine) parseOne(sh *shard, idx int, rec []byte) {
 	var bestParent uint64
 	var bestSL, bestSA int64
 	bestReparse := false
-	scratchLen := 0
+	var bestName []byte
 
 	nrAlloc, nrReal := int64(-1), int64(-1) // $DATA nao-residente (vcn 0)
 	resLen := int64(-1)                     // $DATA residente
@@ -212,11 +212,10 @@ func (e *mftEngine) parseOne(sh *shard, idx int, rec []byte) {
 					bestSA = int64(binary.LittleEndian.Uint64(v[48:]))
 					bestReparse = binary.LittleEndian.Uint32(v[56:])&0x400 != 0
 					nl := int(v[64])
-					if 66+nl*2 <= vlen && nl*2 <= len(sh.scratch) {
-						copy(sh.scratch[:], v[66:66+nl*2])
-						scratchLen = nl * 2
+					if 66+nl*2 <= vlen && nl*2 <= 520 {
+						bestName = v[66 : 66+nl*2]
 					} else {
-						scratchLen = 0
+						bestName = nil
 					}
 				}
 			}
@@ -270,8 +269,8 @@ func (e *mftEngine) parseOne(sh *shard, idx int, rec []byte) {
 	e.flags[idx] = f
 	e.nameRank[idx] = uint8(bestRank + 1)
 	e.nameOff[idx] = uint32(len(sh.nameBuf))
-	sh.nameBuf = append(sh.nameBuf, sh.scratch[:scratchLen]...)
-	e.nameLenB[idx] = uint16(scratchLen)
+	sh.nameBuf = append(sh.nameBuf, bestName...)
+	e.nameLenB[idx] = uint16(len(bestName))
 	e.parentU32[idx] = uint32(bestParent)
 	if !isDir {
 		if sl < 0 {
@@ -391,10 +390,17 @@ func (e *mftEngine) streamMFTPar(runs []mftRun, done map[int]int) int {
 	workCh := make(chan pblock, nbuf)
 
 	shards := make([]*shard, workers)
+	estShardBytes := (len(tasks) * tr / workers) * 20
+	if estShardBytes < 64<<10 {
+		estShardBytes = 64 << 10
+	}
 	var wg sync.WaitGroup
 	wg.Add(workers)
 	for w := 0; w < workers; w++ {
-		sh := &shard{}
+		sh := &shard{
+			nameBuf: make([]byte, 0, estShardBytes),
+			owned:   make([]idxRange, 0, len(tasks)/workers+4),
+		}
 		shards[w] = sh
 		go func(sh *shard) {
 			defer wg.Done()
@@ -453,7 +459,7 @@ func (e *mftEngine) streamMFTPar(runs []mftRun, done map[int]int) int {
 	close(workCh)
 	wg.Wait()
 
-	// ---- merge dos nameBufs (corrige offsets por faixa possuida) ----
+	// ---- merge paralelo dos nameBufs e ajuste de offsets ----
 	acc := uint32(len(e.nameBuf))
 	bases := make([]uint32, workers)
 	for w := range shards {
@@ -463,25 +469,33 @@ func (e *mftEngine) streamMFTPar(runs []mftRun, done map[int]int) int {
 	if acc > uint32(len(e.nameBuf)) {
 		grown := make([]byte, acc)
 		copy(grown, e.nameBuf)
-		pos := uint32(len(e.nameBuf))
+		var mwg sync.WaitGroup
+		mwg.Add(workers)
 		for w := range shards {
-			copy(grown[pos:], shards[w].nameBuf)
-			pos += uint32(len(shards[w].nameBuf))
-		}
-		e.nameBuf = grown
-	}
-	for w := range shards {
-		b := bases[w]
-		if b == 0 {
-			continue
-		}
-		for _, rg := range shards[w].owned {
-			for i := rg.lo; i < rg.hi; i++ {
-				if e.nameLenB[i] != 0 {
-					e.nameOff[i] += b
+			w := w
+			go func() {
+				defer mwg.Done()
+				sh := shards[w]
+				b := bases[w]
+				if len(sh.nameBuf) > 0 {
+					copy(grown[b:], sh.nameBuf)
 				}
-			}
+				if b == 0 {
+					return
+				}
+				nameLenB := e.nameLenB
+				nameOff := e.nameOff
+				for _, rg := range sh.owned {
+					for i := rg.lo; i < rg.hi; i++ {
+						if nameLenB[i] != 0 {
+							nameOff[i] += b
+						}
+					}
+				}
+			}()
 		}
+		mwg.Wait()
+		e.nameBuf = grown
 	}
 
 	// ---- merge de contadores e mapas ----

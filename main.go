@@ -30,7 +30,7 @@ import (
 
 // engineVersion - versao do motor. BUMPAR a cada frente fechada: a medicao so
 // vale se o binario medido for rastreavel ao fonte (SHA-256 reproduzivel).
-const engineVersion = "1.1.0"
+const engineVersion = "1.3.0"
 
 func main() {
 	args := os.Args[1:]
@@ -47,6 +47,12 @@ func main() {
 		runInc(args[1:])
 	case "selftest":
 		runSelfTest(args[1:])
+	case "advise":
+		runAdvise(args[1:])
+	case "relocate":
+		runRelocateCmd(args[1:])
+	case "projects":
+		runProjectsCmd(args[1:])
 	case "version", "--version", "-v":
 		fmt.Printf("aetherscan %s (AetherMind) - go%s %s/%s\n", engineVersion, goVer(), runtime.GOOS, runtime.GOARCH)
 	default:
@@ -100,6 +106,19 @@ uso:
     --repeat N repete o build N vezes (iteracoes 2..N quentes no cache) para
     medir a vazao do PARSER sem o ruido de I/O.
     AETHERSCAN_SERIAL=1 forca o caminho serial original (A/B controlado).
+
+  aetherscan advise <alvo> [--top N] [--out DIR]
+    (IA/Decisao) Modelo de Poco Biestavel de Casimir + 7 Lentes Axiomaticas do ARIA +
+    Protocolo Compacto UCIP. Calcula pressao de colapso de gap, seleciona candidatos
+    seguros de migracao e localiza projetos instantaneamente.
+
+  aetherscan relocate <origem> <destino> [--force] [--dry-run]
+    (Execucao Segura) Migra uma pasta pesada para outro disco e substitui por Junction
+    NTFS (mklink /J) com verificacao das 7 Lentes ARIA, auditoria bit-a-bit e rollback.
+
+  aetherscan projects <alvo> [--top N] [--parasites]
+    (Radar Dev) Mapeia projetos de software (Git, Rust, Go, Node, Python, C#) e calcula
+    a massa de parasitas de build/dependencias (node_modules, target, .venv, etc.).
 `)
 }
 

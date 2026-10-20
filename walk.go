@@ -34,12 +34,84 @@ type walkJob struct {
 	path string
 }
 
+type workQueue struct {
+	mu     sync.Mutex
+	cond   *sync.Cond
+	items  []walkJob
+	head   int
+	closed bool
+}
+
+func newWorkQueue() *workQueue {
+	q := &workQueue{
+		items: make([]walkJob, 0, 1<<18),
+	}
+	q.cond = sync.NewCond(&q.mu)
+	return q
+}
+
+func (q *workQueue) push(job walkJob) {
+	q.mu.Lock()
+	if q.closed {
+		q.mu.Unlock()
+		return
+	}
+	q.items = append(q.items, job)
+	q.cond.Signal()
+	q.mu.Unlock()
+}
+
+func (q *workQueue) pushBatch(jobs []walkJob) {
+	if len(jobs) == 0 {
+		return
+	}
+	q.mu.Lock()
+	if q.closed {
+		q.mu.Unlock()
+		return
+	}
+	q.items = append(q.items, jobs...)
+	if len(jobs) > 1 {
+		q.cond.Broadcast()
+	} else {
+		q.cond.Signal()
+	}
+	q.mu.Unlock()
+}
+
+func (q *workQueue) pop() (walkJob, bool) {
+	q.mu.Lock()
+	for len(q.items) == q.head && !q.closed {
+		q.cond.Wait()
+	}
+	if len(q.items) == q.head {
+		q.mu.Unlock()
+		return walkJob{}, false
+	}
+	j := q.items[q.head]
+	q.head++
+	if q.head > 65536 && q.head > len(q.items)/2 {
+		copy(q.items, q.items[q.head:])
+		q.items = q.items[:len(q.items)-q.head]
+		q.head = 0
+	}
+	q.mu.Unlock()
+	return j, true
+}
+
+func (q *workQueue) close() {
+	q.mu.Lock()
+	q.closed = true
+	q.cond.Broadcast()
+	q.mu.Unlock()
+}
+
 type walkers struct {
 	root    string
 	workers int
 	topN    int
 	arena   dirArena
-	queue   chan walkJob
+	queue   *workQueue
 	jobs    sync.WaitGroup
 	workWG  sync.WaitGroup
 	start   time.Time
@@ -89,7 +161,7 @@ func newWalkers(root string, workers, topN int, filesCSV bool, shardFn func(i in
 		root:     root,
 		workers:  workers,
 		topN:     topN,
-		queue:    make(chan walkJob, 1<<16),
+		queue:    newWorkQueue(),
 		filesCSV: filesCSV,
 	}
 	w.ws = make([]*walkWorker, workers)
@@ -147,7 +219,11 @@ func (w *walkers) run() {
 		go func(ww *walkWorker) {
 			defer w.workWG.Done()
 			defer w.flush(ww)
-			for j := range w.queue {
+			for {
+				j, ok := w.queue.pop()
+				if !ok {
+					break
+				}
 				w.scanDir(ww, j)
 				w.jobs.Done()
 			}
@@ -155,10 +231,10 @@ func (w *walkers) run() {
 	}
 
 	w.jobs.Add(1)
-	w.queue <- walkJob{rootIdx, w.root}
+	w.queue.push(walkJob{rootIdx, w.root})
 	go func() {
 		w.jobs.Wait()
-		close(w.queue)
+		w.queue.close()
 	}()
 
 	w.workWG.Wait()
@@ -264,10 +340,12 @@ func (w *walkers) scanDir(ww *walkWorker, j walkJob) {
 	if len(subNames) > 0 {
 		first := w.arena.addBatch(j.idx, w.arena.depthOf(j.idx)+1, subNames)
 		n := len(subNames)
-		w.jobs.Add(n)
+		batch := make([]walkJob, n)
 		for i, nm := range subNames {
-			w.queue <- walkJob{idx: first + int32(i), path: joinPath(j.path, nm)}
+			batch[i] = walkJob{idx: first + int32(i), path: joinPath(j.path, nm)}
 		}
+		w.jobs.Add(n)
+		w.queue.pushBatch(batch)
 	}
 }
 

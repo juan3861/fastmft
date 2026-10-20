@@ -18,9 +18,11 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -1231,7 +1233,9 @@ func (e *mftEngine) build() error {
 	e.nameOff = make([]uint32, n)
 	e.nameRank = make([]uint8, n)
 	e.nameLenB = make([]uint16, n)
-	e.nameBuf = make([]byte, 0, n*16)
+	if !(e.nobuf || (e.dumpPat == "" && os.Getenv("AETHERSCAN_SERIAL") == "")) {
+		e.nameBuf = make([]byte, 0, n*16)
+	}
 	e.filesAgg = make([]int32, n)
 	e.subdirsAgg = make([]int32, n)
 
@@ -1580,19 +1584,94 @@ func (e *mftEngine) fillReport(r *Report) {
 	r.RecsRead = e.recsRead
 	r.RecsTotal = e.recordCount
 
-	// top dirs / top files / extensões
+	// top dirs / top files / extensões (paralelizado por faixas)
 	dirTop := newIdxTop(e.topN, e.sizeL)
 	fileTop := newIdxTop(e.topN, e.sizeL)
-	for i := 1; i < e.recordCount; i++ {
-		f := e.flags[i]
-		if f&recNamed == 0 || i == rootRecIdx {
-			continue
+	n := e.recordCount
+	nw := runtime.NumCPU()
+	if nw > 16 {
+		nw = 16
+	}
+	if n < 65536 || nw <= 1 {
+		for i := 1; i < n; i++ {
+			f := e.flags[i]
+			if f&recNamed == 0 || i == rootRecIdx {
+				continue
+			}
+			if f&recDir != 0 {
+				dirTop.offer(int32(i))
+			} else {
+				fileTop.offer(int32(i))
+				e.addExtKey(e.nameBuf[e.nameOff[i]:e.nameOff[i]+uint32(e.nameLenB[i])], e.sizeL[i])
+			}
 		}
-		if f&recDir != 0 {
-			dirTop.offer(int32(i))
-		} else {
-			fileTop.offer(int32(i))
-			e.addExtKey(e.nameBuf[e.nameOff[i]:e.nameOff[i]+uint32(e.nameLenB[i])], e.sizeL[i])
+	} else {
+		type repShard struct {
+			dirTop  *idxTop
+			fileTop *idxTop
+			extMap  map[extKey]*extStat
+		}
+		shards := make([]repShard, nw)
+		var wg sync.WaitGroup
+		wg.Add(nw)
+		chunk := (n - 1 + nw - 1) / nw
+		for w := 0; w < nw; w++ {
+			w := w
+			lo := 1 + w*chunk
+			hi := lo + chunk
+			if hi > n {
+				hi = n
+			}
+			go func() {
+				defer wg.Done()
+				dt := newIdxTop(e.topN, e.sizeL)
+				ft := newIdxTop(e.topN, e.sizeL)
+				em := make(map[extKey]*extStat, 128)
+				flags := e.flags
+				nameBuf := e.nameBuf
+				nameOff := e.nameOff
+				nameLenB := e.nameLenB
+				sizeL := e.sizeL
+				for i := lo; i < hi; i++ {
+					f := flags[i]
+					if f&recNamed == 0 || i == rootRecIdx {
+						continue
+					}
+					if f&recDir != 0 {
+						dt.offer(int32(i))
+					} else {
+						ft.offer(int32(i))
+						k := extKeyOfUTF16(nameBuf[nameOff[i] : nameOff[i]+uint32(nameLenB[i])])
+						s := em[k]
+						if s == nil {
+							s = &extStat{}
+							em[k] = s
+						}
+						s.Count++
+						s.Bytes += sizeL[i]
+					}
+				}
+				sort.Slice(dt.items, func(a, b int) bool { return dt.items[a] < dt.items[b] })
+				sort.Slice(ft.items, func(a, b int) bool { return ft.items[a] < ft.items[b] })
+				shards[w] = repShard{dirTop: dt, fileTop: ft, extMap: em}
+			}()
+		}
+		wg.Wait()
+		for w := 0; w < nw; w++ {
+			for _, idx := range shards[w].dirTop.items {
+				dirTop.offer(idx)
+			}
+			for _, idx := range shards[w].fileTop.items {
+				fileTop.offer(idx)
+			}
+			for k, v := range shards[w].extMap {
+				if dst := e.extMap[k]; dst != nil {
+					dst.Count += v.Count
+					dst.Bytes += v.Bytes
+				} else {
+					e.extMap[k] = v
+				}
+			}
 		}
 	}
 	for _, i := range dirTop.sortedDesc() {
@@ -1616,30 +1695,34 @@ func (e *mftEngine) fillReport(r *Report) {
 //
 // Antes: e.pathOf(i) por diretório, reconstruindo a cadeia de pais a cada vez
 // (O(profundidade) + alocações) -> 405 k dirs x ~8 níveis em C:.
-// Agora: DFS sobre o índice de filhos já construído em build(), com caminho
-// incremental: O(n) e UMA string por diretório.
+// Agora: DFS sobre o índice de filhos (apenas diretorios) construído em build(),
+// usando joinPathUTF16 (1 alocacao por diretorio em vez de 3).
 func (e *mftEngine) dirPaths() []string {
 	paths := make([]string, e.recordCount)
 	paths[rootRecIdx] = e.rootName
 	stack := make([]int32, 0, 1024)
 	stack = append(stack, rootRecIdx)
+	childStart := e.childStart
+	childList := e.childList
+	nameOff := e.nameOff
+	nameLenB := e.nameLenB
+	nameBuf := e.nameBuf
 	for len(stack) > 0 {
 		n := stack[len(stack)-1]
 		stack = stack[:len(stack)-1]
 		pn := paths[n]
-		for c := e.childStart[n]; c < e.childStart[n+1]; c++ {
-			ch := e.childList[c]
-			if e.flags[ch]&recDir == 0 {
-				continue
-			}
-			paths[ch] = joinPath(pn, e.nameUtf8(int(ch)))
+		for c := childStart[n]; c < childStart[n+1]; c++ {
+			ch := childList[c]
+			off := nameOff[ch]
+			l := uint32(nameLenB[ch])
+			paths[ch] = joinPathUTF16(pn, nameBuf[off:off+l])
 			stack = append(stack, ch)
 		}
 	}
 	return paths
 }
 
-// writeDirsCSV - exporta todos os diretórios (ordenado por tamanho).
+// writeDirsCSV - exporta todos os diretórios (ordenado por tamanho) sem alocações por linha.
 func (e *mftEngine) writeDirsCSV(path string) error {
 	fw, err := createCSV(path)
 	if err != nil {
@@ -1649,22 +1732,53 @@ func (e *mftEngine) writeDirsCSV(path string) error {
 
 	paths := e.dirPaths()
 
-	rows := make([]int32, 0, 1024)
+	rows := make([]int32, 0, len(e.childList)+16)
+	flags := e.flags
 	for i := 1; i < e.recordCount; i++ {
-		if e.flags[i]&(recNamed|recDir) == (recNamed | recDir) {
+		if flags[i]&(recNamed|recDir) == (recNamed | recDir) {
 			rows = append(rows, int32(i))
 		}
 	}
-	sort.Slice(rows, func(a, b int) bool { return e.sizeL[rows[a]] > e.sizeL[rows[b]] })
+	sizeL := e.sizeL
+	sizeA := e.sizeA
+	filesAgg := e.filesAgg
+	subdirsAgg := e.subdirsAgg
+	sort.Slice(rows, func(a, b int) bool { return sizeL[rows[a]] > sizeL[rows[b]] })
 
-	row := make([]string, 5)
+	lineBuf := make([]byte, 0, 512)
+	rowFallback := make([]string, 5)
 	for _, i := range rows {
-		row[0] = paths[i]
-		row[1] = strconv.FormatInt(e.sizeL[i], 10)
-		row[2] = strconv.FormatInt(e.sizeA[i], 10)
-		row[3] = strconv.FormatInt(int64(e.filesAgg[i]), 10)
-		row[4] = strconv.FormatInt(int64(e.subdirsAgg[i]), 10)
-		if err := fw.Write(row); err != nil {
+		p := paths[i]
+		needsQuote := false
+		for k := 0; k < len(p); k++ {
+			c := p[k]
+			if c == ',' || c == '"' || c == '\r' || c == '\n' {
+				needsQuote = true
+				break
+			}
+		}
+		if needsQuote {
+			rowFallback[0] = p
+			rowFallback[1] = strconv.FormatInt(sizeL[i], 10)
+			rowFallback[2] = strconv.FormatInt(sizeA[i], 10)
+			rowFallback[3] = strconv.FormatInt(int64(filesAgg[i]), 10)
+			rowFallback[4] = strconv.FormatInt(int64(subdirsAgg[i]), 10)
+			if err := fw.Write(rowFallback); err != nil {
+				return err
+			}
+			continue
+		}
+		lineBuf = append(lineBuf[:0], p...)
+		lineBuf = append(lineBuf, ',')
+		lineBuf = strconv.AppendInt(lineBuf, sizeL[i], 10)
+		lineBuf = append(lineBuf, ',')
+		lineBuf = strconv.AppendInt(lineBuf, sizeA[i], 10)
+		lineBuf = append(lineBuf, ',')
+		lineBuf = strconv.AppendInt(lineBuf, int64(filesAgg[i]), 10)
+		lineBuf = append(lineBuf, ',')
+		lineBuf = strconv.AppendInt(lineBuf, int64(subdirsAgg[i]), 10)
+		lineBuf = append(lineBuf, '\n')
+		if _, err := fw.b.Write(lineBuf); err != nil {
 			return err
 		}
 	}

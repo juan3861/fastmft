@@ -10,6 +10,7 @@ import (
 	"os"
 	"sort"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"time"
 )
@@ -191,16 +192,35 @@ func (w *walkers) writeDirsCSV(path string) error {
 	sort.Slice(idx, func(a, b int) bool {
 		return w.arena.at(idx[a]).Size > w.arena.at(idx[b]).Size
 	})
+	lineBuf := make([]byte, 0, 512)
+	rowFallback := make([]string, 5)
 	for _, i := range idx {
 		nd := w.arena.at(i)
-		if err := cw.Write([]string{
-			paths[i],
-			strconv.FormatInt(nd.Size, 10),
-			strconv.FormatInt(nd.Alloc, 10),
-			strconv.FormatInt(nd.Files, 10),
-			strconv.FormatInt(nd.Subdirs, 10),
-		}); err != nil {
-			return err
+		p := paths[i]
+		if !strings.ContainsAny(p, ",\"\r\n") {
+			lineBuf = lineBuf[:0]
+			lineBuf = append(lineBuf, p...)
+			lineBuf = append(lineBuf, ',')
+			lineBuf = strconv.AppendInt(lineBuf, nd.Size, 10)
+			lineBuf = append(lineBuf, ',')
+			lineBuf = strconv.AppendInt(lineBuf, nd.Alloc, 10)
+			lineBuf = append(lineBuf, ',')
+			lineBuf = strconv.AppendInt(lineBuf, nd.Files, 10)
+			lineBuf = append(lineBuf, ',')
+			lineBuf = strconv.AppendInt(lineBuf, nd.Subdirs, 10)
+			lineBuf = append(lineBuf, '\r', '\n')
+			if _, err := cw.b.Write(lineBuf); err != nil {
+				return err
+			}
+		} else {
+			rowFallback[0] = p
+			rowFallback[1] = strconv.FormatInt(nd.Size, 10)
+			rowFallback[2] = strconv.FormatInt(nd.Alloc, 10)
+			rowFallback[3] = strconv.FormatInt(nd.Files, 10)
+			rowFallback[4] = strconv.FormatInt(nd.Subdirs, 10)
+			if err := cw.Write(rowFallback); err != nil {
+				return err
+			}
 		}
 	}
 	return nil

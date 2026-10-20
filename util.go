@@ -112,22 +112,28 @@ func utf16Bytes(b []byte) string {
 	if n == 0 {
 		return ""
 	}
-	s := make([]uint16, n)
-	for i := 0; i < n; i++ {
-		s[i] = uint16(b[2*i]) | uint16(b[2*i+1])<<8
+	var stack [512]byte
+	if n <= len(stack) {
+		ascii := true
+		for i := 0; i < n; i++ {
+			lo := b[2*i]
+			hi := b[2*i+1]
+			if hi != 0 || lo >= 0x80 {
+				ascii = false
+				break
+			}
+			stack[i] = lo
+		}
+		if ascii {
+			return string(stack[:n])
+		}
 	}
-	// decodifica manualmente (sem importar unicode/utf16 para manter quente)
-	return decodeUTF16(s)
-}
-
-func decodeUTF16(s []uint16) string {
-	// implementacao enxuta: cobre BMP + surrogate pairs
 	var sb strings.Builder
-	sb.Grow(len(s))
-	for i := 0; i < len(s); i++ {
-		r := rune(s[i])
-		if r >= 0xD800 && r <= 0xDBFF && i+1 < len(s) {
-			r2 := rune(s[i+1])
+	sb.Grow(n)
+	for i := 0; i < n; i++ {
+		r := rune(uint16(b[2*i]) | uint16(b[2*i+1])<<8)
+		if r >= 0xD800 && r <= 0xDBFF && i+1 < n {
+			r2 := rune(uint16(b[2*(i+1)]) | uint16(b[2*(i+1)+1])<<8)
 			if r2 >= 0xDC00 && r2 <= 0xDFFF {
 				r = ((r - 0xD800) << 10) + (r2 - 0xDC00) + 0x10000
 				i++
@@ -136,4 +142,39 @@ func decodeUTF16(s []uint16) string {
 		sb.WriteRune(r)
 	}
 	return sb.String()
+}
+
+// joinPathUTF16 - concatena parent + `\` + nome UTF-16LE em uma unica alocacao no caso ASCII comum.
+func joinPathUTF16(parent string, b []byte) string {
+	n := len(b) / 2
+	if n == 0 {
+		return parent
+	}
+	plen := len(parent)
+	sep := 1
+	if plen > 0 && parent[plen-1] == '\\' {
+		sep = 0
+	}
+	var stack [1024]byte
+	if plen+sep+n <= len(stack) {
+		copy(stack[:plen], parent)
+		if sep == 1 {
+			stack[plen] = '\\'
+		}
+		outOff := plen + sep
+		ascii := true
+		for i := 0; i < n; i++ {
+			lo := b[2*i]
+			hi := b[2*i+1]
+			if hi != 0 || lo >= 0x80 {
+				ascii = false
+				break
+			}
+			stack[outOff+i] = lo
+		}
+		if ascii {
+			return string(stack[:outOff+n])
+		}
+	}
+	return joinPath(parent, utf16Bytes(b))
 }
